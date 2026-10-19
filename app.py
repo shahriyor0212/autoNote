@@ -1,11 +1,16 @@
 import os
 import io
 import streamlit as st
+import streamlit.components.v1 as components
 import docx
 import pypdf
 from fpdf import FPDF
 from google import genai
 from google.genai import types
+
+# Declare browser localStorage custom component
+_COMPONENT_PATH = os.path.join(os.path.dirname(__file__), "components", "local_storage")
+local_storage_comp = components.declare_component("local_storage", path=_COMPONENT_PATH)
 
 # Auto-load .env file if present
 if os.path.exists(".env"):
@@ -176,29 +181,72 @@ def build_pdf(markdown_text: str, subject: str) -> bytes:
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # API Key detection / input
+    # Handle browser localStorage communication
+    if "ls_action" not in st.session_state:
+        st.session_state.ls_action = "read"
+    if "ls_key_value" not in st.session_state:
+        st.session_state.ls_key_value = ""
+
+    browser_stored_key = local_storage_comp(
+        action=st.session_state.ls_action,
+        key_value=st.session_state.ls_key_value,
+        key="ls_component_widget"
+    )
+
+    # Reset action to "read" after save/clear
+    if st.session_state.ls_action != "read":
+        st.session_state.ls_action = "read"
+        st.session_state.ls_key_value = ""
+
     env_api_key = os.environ.get("GEMINI_API_KEY", "")
+    default_key_val = browser_stored_key or env_api_key or ""
+
     api_key_input = st.text_input(
         "Gemini API Key",
-        value=env_api_key,
+        value=default_key_val,
         type="password",
-        help="Get your key at aistudio.google.com (usually starts with AIzaSy...)"
+        help="Saved in your browser's localStorage for future sessions."
     )
 
     clean_key_check = api_key_input.strip().strip("'\"")
+
+    col_ls1, col_ls2 = st.columns(2)
+    with col_ls1:
+        if st.button("💾 Save Key", help="Save key to browser's localStorage and local .env", use_container_width=True):
+            if clean_key_check:
+                st.session_state.ls_action = "save"
+                st.session_state.ls_key_value = clean_key_check
+                try:
+                    with open(".env", "w", encoding="utf-8") as f:
+                        f.write(f"GEMINI_API_KEY={clean_key_check}\n")
+                except Exception:
+                    pass
+                st.rerun()
+
+    with col_ls2:
+        if st.button("🗑️ Forget", help="Clear key from browser's localStorage", use_container_width=True):
+            st.session_state.ls_action = "clear"
+            st.session_state.ls_key_value = ""
+            try:
+                if os.path.exists(".env"):
+                    os.remove(".env")
+            except Exception:
+                pass
+            st.rerun()
+
     if clean_key_check:
         if not clean_key_check.isascii():
-            st.error("⚠️ The key entered has invalid/non-ASCII characters (e.g. copied emoji like ❌ or error text). Please paste only your clean API key.")
+            st.error("⚠️ Invalid characters detected. Please paste only your clean API key.")
         elif not clean_key_check.startswith("AIza"):
-            st.info("ℹ️ Google API keys typically begin with `AIza...`. Make sure you didn't paste an error message.")
+            st.info("ℹ️ Google API keys typically begin with `AIza...`.")
         else:
-            st.success("✅ Key format valid")
+            st.success("✅ Key stored in browser (localStorage)")
 
     model_choice = st.selectbox(
         "Gemini Model",
         options=["gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash"],
         index=0,
-        help="Recommended: gemini-3.8-flash"
+        help="Recommended: gemini-3.8-flash (auto-switches to 2.0-flash if busy)"
     )
     
     st.divider()
@@ -237,6 +285,30 @@ uploaded_file = st.file_uploader(
     type=["pdf", "docx", "txt", "png", "jpg", "jpeg"],
     help="Supports PDF, Word (.docx), Plain Text (.txt), or image notes."
 )
+
+# Optional Page Selection for PDFs (Great for fast processing of large textbooks)
+selected_page_range = None
+if uploaded_file and uploaded_file.name.lower().endswith(".pdf"):
+    try:
+        pdf_reader = pypdf.PdfReader(io.BytesIO(uploaded_file.getvalue()))
+        total_pages = len(pdf_reader.pages)
+        if total_pages > 1:
+            col_p1, col_p2 = st.columns([1, 1])
+            with col_p1:
+                analyze_all = st.checkbox("Analyze all pages", value=(total_pages <= 10))
+            with col_p2:
+                st.caption(f"📄 Detected **{total_pages} pages** in document.")
+
+            if not analyze_all:
+                selected_page_range = st.slider(
+                    "Select page range to analyze (⚡ much faster for textbooks):",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=(1, min(10, total_pages)),
+                    help="For large textbooks (e.g. 100+ pages), picking the specific chapter or lesson generates notes in seconds."
+                )
+    except Exception:
+        pass
 
 # Determine button disabled state
 # Requirement: Click the button -> won't click until the student downloads the PDF (greyed out)
@@ -282,8 +354,40 @@ if generate_clicked:
 
                 # Prepare contents for Gemini based on file type
                 if file_name.endswith(".pdf"):
-                    pdf_part = types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
-                    contents = [pdf_part, prompt_text]
+                    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+                    total_pdf_pages = len(reader.pages)
+
+                    if selected_page_range:
+                        pages_to_process = list(range(selected_page_range[0] - 1, selected_page_range[1]))
+                    else:
+                        pages_to_process = list(range(total_pdf_pages))
+
+                    # 1. Try fast text extraction first (10x faster than sending raw visual pages)
+                    extracted_text = ""
+                    try:
+                        text_pages = []
+                        for idx in pages_to_process:
+                            t = reader.pages[idx].extract_text()
+                            if t and t.strip():
+                                text_pages.append(f"--- Page {idx + 1} ---\n{t}")
+                        extracted_text = "\n\n".join(text_pages).strip()
+                    except Exception:
+                        extracted_text = ""
+
+                    if len(extracted_text) > 100:
+                        # Digital PDF: Send pure text for near-instant processing
+                        contents = [f"Document Content:\n{extracted_text}\n\nTask:\n{prompt_text}"]
+                    else:
+                        # Scanned PDF: Slice only the selected pages to save bandwidth & processing time
+                        writer = pypdf.PdfWriter()
+                        for idx in pages_to_process:
+                            writer.add_page(reader.pages[idx])
+                        buf = io.BytesIO()
+                        writer.write(buf)
+                        sliced_pdf_bytes = buf.getvalue()
+
+                        pdf_part = types.Part.from_bytes(data=sliced_pdf_bytes, mime_type="application/pdf")
+                        contents = [pdf_part, prompt_text]
                 elif file_name.endswith(".docx"):
                     doc = docx.Document(io.BytesIO(file_bytes))
                     doc_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
@@ -297,13 +401,75 @@ if generate_clicked:
                     text_content = file_bytes.decode("utf-8", errors="ignore")
                     contents = [f"Document Content:\n{text_content}\n\nTask:\n{prompt_text}"]
 
-                # Call Gemini Flash
-                response = client.models.generate_content(
-                    model=model_choice,
-                    contents=contents
-                )
+                # Auto-save valid key to browser localStorage and local .env
+                if clean_key_check:
+                    st.session_state.ls_action = "save"
+                    st.session_state.ls_key_value = clean_key_check
+                    try:
+                        with open(".env", "w", encoding="utf-8") as f:
+                            f.write(f"GEMINI_API_KEY={clean_key_check}\n")
+                    except Exception:
+                        pass
 
-                generated_text = response.text or "No response received."
+                # Models to try in order (if primary model suffers 503 high demand spike, auto-fallback)
+                models_to_try = [model_choice]
+                for fb in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                    if fb not in models_to_try:
+                        models_to_try.append(fb)
+
+                stream_container = st.empty()
+                status_box = st.empty()
+                accumulated_text = []
+                success = False
+                last_error = None
+
+                for current_model in models_to_try:
+                    try:
+                        if current_model != model_choice:
+                            status_box.warning(
+                                f"⚠️ `{model_choice}` is experiencing temporary high demand (503) on Google's servers. "
+                                f"Automatically switching to `{current_model}`..."
+                            )
+
+                        gen_config = None
+                        if "flash" in current_model.lower() and ("2.5" in current_model.lower() or "3.8" in current_model.lower()):
+                            gen_config = types.GenerateContentConfig(
+                                thinking_config=types.ThinkingConfig(thinking_budget=0)
+                            )
+
+                        accumulated_text = []
+                        response_stream = client.models.generate_content_stream(
+                            model=current_model,
+                            contents=contents,
+                            config=gen_config
+                        )
+
+                        for chunk in response_stream:
+                            if chunk.text:
+                                accumulated_text.append(chunk.text)
+                                stream_container.markdown("".join(accumulated_text))
+
+                        generated_text = "".join(accumulated_text).strip()
+                        if generated_text:
+                            success = True
+                            if current_model != model_choice:
+                                status_box.success(f"✅ Notes successfully generated using `{current_model}`!")
+                            break
+
+                    except Exception as err:
+                        err_str = str(err)
+                        last_error = err
+                        # If 503 UNAVAILABLE or 429 high demand / capacity spike, fall back to next model
+                        if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "high demand" in err_str.lower():
+                            continue
+                        else:
+                            raise err
+
+                if not success:
+                    if last_error:
+                        raise last_error
+                    else:
+                        raise RuntimeError("No response received from any model.")
 
                 # Create exportable documents
                 docx_data = build_docx(generated_text, subject.strip())
